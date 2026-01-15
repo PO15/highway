@@ -1,0 +1,22 @@
+# --- Python: Cache / Bytecode ---
+__pycache__/
+*.py[cod]
+
+# --- Virtuelle Umgebungen ---
+.venv/
+venv/
+env/
+
+# --- Jupyter / Notebooks ---
+.ipynb_checkpoints/
+
+# --- VS Code ---
+.vscode/
+
+# --- macOS ---
+.DS_Store
+
+# --- Logs & Outputs (typisch bei Simulationen) ---
+*.log
+runs/
+output/
