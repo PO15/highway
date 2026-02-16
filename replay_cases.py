@@ -58,11 +58,11 @@ def build_base_config():
 def main():
     base_config = build_base_config()
 
-    results = load_results("/Users/philippotto/Desktop/highway/outputs/is_run_20260204_011027/is_episodes.json")
+    results = load_results("/Users/philippotto/Desktop/highway/outputs/run_20260214_163050/mc_results_parallel.json")
     print("Geladene Ergebnisse:", len(results))
 
     # -------- Option A: per episode_seed auswählen --------
-    seed_to_watch = 1078  # <- hier ändern
+    seed_to_watch = 12  # <- hier ändern
     case = find_case_by_seed(results, seed_to_watch)
 
     

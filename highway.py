@@ -1,108 +1,194 @@
-import time
-import types
+import json
+import numpy as np
 import gymnasium as gym
-import highway_env  # registriert env-ids
+import highway_env  # noqa: F401
 
 
-def convert_ego_to_idm(env, target_speed_kmh=None):
-    """
-    Ersetzt das kontrollierte Ego-Fahrzeug durch ein IDMVehicle (IDM + MOBIL),
-    und sorgt dafür, dass env.step(action) die Action ignoriert (IDM fährt selbst).
-    """
-    from highway_env.vehicle.behavior import IDMVehicle  # siehe Doku: highway_env.vehicle.behavior.IDMVehicle
-
+# ---------------------------------------------------------
+# Dichte-Messung: fixes Fenster (veh/km/lane)
+# ---------------------------------------------------------
+def measure_density_window(env, window_m=1000.0, include_ego=False):
     uw = env.unwrapped
+    ego = uw.vehicle
+    x0 = float(ego.position[0])
+    half = float(window_m) / 2.0
 
-    old_ego = uw.vehicle
-    idm_ego = IDMVehicle.create_from(old_ego)  # Doku: create_from() kopiert Dynamik + Target-Dynamik :contentReference[oaicite:2]{index=2}
+    lanes_count = int(uw.config.get("lanes_count", 3))
 
-    # optional: Wunschgeschwindigkeit setzen
-    if target_speed_kmh is not None:
-        idm_ego.target_speed = target_speed_kmh / 3.6
+    count_total = 0
+    for v in uw.road.vehicles:
+        if (not include_ego) and (v is ego):
+            continue
+        x = float(v.position[0])
+        if (x0 - half) <= x <= (x0 + half):
+            count_total += 1
 
-    # 1) ego in road.vehicles ersetzen
-    for i, v in enumerate(uw.road.vehicles):
-        if v is old_ego:
-            uw.road.vehicles[i] = idm_ego
-            break
+    L_km = float(window_m) / 1000.0
+    rho_avg = count_total / (L_km * lanes_count) if L_km > 0 else 0.0
 
-    # 2) env.vehicle / controlled_vehicles aktualisieren
-    uw.vehicle = idm_ego
-    if hasattr(uw, "controlled_vehicles"):
-        if uw.controlled_vehicles:
-            uw.controlled_vehicles[0] = idm_ego
-        else:
-            uw.controlled_vehicles = [idm_ego]
-
-    # 3) action_type so patchen, dass er die Action ignoriert (IDMVehicle unterstützt keine externen Actions) :contentReference[oaicite:3]{index=3}
-    try:
-        uw.action_type.controlled_vehicle = idm_ego  # property existiert in der ActionType-API :contentReference[oaicite:4]{index=4}
-    except Exception:
-        pass
-
-    def _act_ignore(self, action):
-        # Action aus Gym ignorieren, IDM/MOBIL entscheidet selbst
-        self.controlled_vehicle.act(None)
-
-    uw.action_type.act = types.MethodType(_act_ignore, uw.action_type)
-
-    return idm_ego
+    return float(rho_avg)
 
 
-def main():
-    scenario_config = {
-        "vehicles_count": 10,
-        "duration": 10,
-        "policy_frequency": 10,
-        "simulation_frequency": 15,
-        "lanes_count": 3,
-        "ego_spacing": 1,   # kleiner = dichterer Start (probier 0.7–2.0)
-        "vehicles_density": 2.0, # steuert Traffic-Spawn-Dichte (spacing = 1 / vehicles_density)
-        "screen_width": 1400,
-        "screen_height": 350,
-        "scaling": 1,              # kleiner = mehr Strecke sichtbar
-        "centering_position": [0.35, 0.5],
-        "observation": {
-            "type": "Kinematics",
-            "vehicles_count": 15,
-            "features": ["x", "y", "vx", "vy"],
-            "absolute": False,
-        },
-        "action": {"type": "DiscreteMetaAction"},
-    }
-
-    env = gym.make("highway-v0", render_mode="human")
-
-    #obs, info = env.reset(options={"config": scenario_config})
-    obs, info = env.reset(seed=0, options={"config": scenario_config}) #seed gesetzt
-
-    convert_ego_to_idm(env, target_speed_kmh=200)  # <-- Ego fährt jetzt IDM+MOBIL selbst
-
-    print("Starte Simulation (Ego = IDMVehicle). Beenden: Ctrl+C")
-
-    print("config vehicles_count:", env.unwrapped.config["vehicles_count"])
-    print("vehicles in road:", len(env.unwrapped.road.vehicles))
+# ---------------------------------------------------------
+# LOS (optional, HCM grob umgerechnet auf veh/km/ln)
+# ---------------------------------------------------------
+def los_from_density_km_lane(rho):
+    # 11/18/26/35/45 pc/mi/ln -> /1.609 ≈ 6.8/11.2/16.2/21.7/28.0 veh/km/ln
+    if rho < 6.8:  return "A"
+    if rho < 11.2: return "B"
+    if rho < 16.2: return "C"
+    if rho < 21.7: return "D"
+    if rho < 28.0: return "E"
+    return "F"
 
 
-    try:
-        for step in range(2000):
-            # Action ist egal, wird ignoriert (IDM fährt selbst)
-            action = env.action_space.sample()
+# ---------------------------------------------------------
+# Kalibrierung für EIN lanes_count
+# ---------------------------------------------------------
+def calibrate_for_lanes(
+    lanes_count,
+    test_values,
+    vehicles_count=50,
+    n_samples=20,
+    window_m=1000.0,
+    include_ego=False,
+):
+    env = gym.make("highway-v0", render_mode=None)
 
-            obs, reward, terminated, truncated, info = env.step(action)
-            time.sleep(0.03)
+    results = {}
+    for vd in test_values:
+        config = {
+            "vehicles_count": int(vehicles_count),
+            "lanes_count": int(lanes_count),
+            "vehicles_density": float(vd),
+            "duration": 1,
+            "policy_frequency": 1,
+            "simulation_frequency": 15,
+        }
 
-            if terminated or truncated:
-                obs, info = env.reset(seed=0, options={"config": scenario_config}) #seed gesetzt
-                convert_ego_to_idm(env, target_speed_kmh=200)
+        rhos = []
+        for k in range(int(n_samples)):
+            # Reproduzierbar: seed hängt von lanes, vd, k ab
+            seed = 100_000 + 10_000 * int(lanes_count) + 100 * int(round(vd * 100)) + k
+            env.reset(seed=seed, options={"config": config})
+            rhos.append(measure_density_window(env, window_m=window_m, include_ego=include_ego))
 
-    except KeyboardInterrupt:
-        print("\nAbbruch per Ctrl+C.")
+        mean_rho = float(np.mean(rhos)) if rhos else 0.0
+        std_rho = float(np.std(rhos)) if rhos else 0.0
 
-    finally:
-        env.close()
-        print("Env geschlossen ✅")
+        results[float(vd)] = {
+            "mean": mean_rho,
+            "std": std_rho,
+            "los": los_from_density_km_lane(mean_rho),
+            "samples": [float(x) for x in rhos],
+        }
+
+    env.close()
+    return results
 
 
+# ---------------------------------------------------------
+# Kalibrierung für mehrere lanes_count (2/3/4)
+# ---------------------------------------------------------
+def calibrate_all_lanes(
+    lanes_list=(2, 3, 4),
+    test_values=(0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 2.5),
+    vehicles_count=50,
+    n_samples=20,
+    window_m=1000.0,
+    include_ego=False,
+    save_path="density_calibration_by_lanes.json",
+):
+    print("\n" + "=" * 78)
+    print("KALIBRIERUNG: vehicles_density → rho_eff [veh/km/lane], getrennt nach lanes_count")
+    print("=" * 78)
+    print(f"vehicles_count={vehicles_count}, window={window_m:.0f} m, n_samples={n_samples}, include_ego={include_ego}\n")
+
+    all_results = {}
+
+    for lanes in lanes_list:
+        print(f"\n--- lanes_count = {lanes} ---")
+        res = calibrate_for_lanes(
+            lanes_count=lanes,
+            test_values=test_values,
+            vehicles_count=vehicles_count,
+            n_samples=n_samples,
+            window_m=window_m,
+            include_ego=include_ego,
+        )
+        all_results[int(lanes)] = {
+            "meta": {
+                "lanes_count": int(lanes),
+                "vehicles_count": int(vehicles_count),
+                "window_m": float(window_m),
+                "n_samples": int(n_samples),
+                "include_ego": bool(include_ego),
+            },
+            "map": {str(vd): res[vd] for vd in sorted(res.keys())},
+        }
+
+        # Pretty print summary
+        print("| vehicles_density | rho_eff_mean [veh/km/lane] | rho_eff_std | LOS |")
+        print("|------------------|---------------------------|-------------|-----|")
+        for vd in sorted(res.keys()):
+            print(f"| {vd:16.2f} | {res[vd]['mean']:25.1f} | {res[vd]['std']:11.1f} | {res[vd]['los']:3s} |")
+
+    # Save JSON
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, indent=2, ensure_ascii=False)
+
+    print(f"\n✅ Gespeichert: {save_path}")
+    return all_results
+
+
+# ---------------------------------------------------------
+# Invertierung: Ziel-Dichte -> vehicles_density (Interpolation)
+# ---------------------------------------------------------
+def vd_for_target_density(calib_map_for_one_lane, rho_target):
+    """
+    calib_map_for_one_lane: dict wie all_results[lanes]["map"]
+                            keys sind strings "0.3", "0.5", ...
+    rho_target: gewünschte Dichte in veh/km/lane
+    """
+    vds = np.array(sorted([float(k) for k in calib_map_for_one_lane.keys()]), dtype=float)
+    rhos = np.array([calib_map_for_one_lane[str(vd)]["mean"] for vd in vds], dtype=float)
+
+    # monotone Annahme (typisch): rho steigt mit vd
+    order = np.argsort(rhos)
+    rhos = rhos[order]
+    vds = vds[order]
+
+    # clamp auf Randbereich
+    rho_target = float(rho_target)
+    if rho_target <= rhos[0]:
+        return float(vds[0])
+    if rho_target >= rhos[-1]:
+        return float(vds[-1])
+
+    # lineare Interpolation: rho -> vd
+    return float(np.interp(rho_target, rhos, vds))
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    all_results = calibrate_all_lanes(
+        lanes_list=(2, 3, 4),
+        test_values=(0.5, 1.0, 1.5, 2.0, 2.5, 3),
+        vehicles_count=80,
+        n_samples=100,
+        window_m=1000.0,
+        include_ego=False,
+        save_path="density_calibration_by_lanes.json",
+    )
+
+    # Beispiel: gleiche Ziel-Dichte für alle Lanes wählen
+    rho_target = 18.0  # veh/km/lane, Beispiel
+    print("\n" + "=" * 78)
+    print(f"Beispiel Invertierung: Ziel-Dichte rho_target = {rho_target:.1f} veh/km/lane")
+    print("=" * 78)
+    for lanes in (2, 3, 4):
+        calib_map = all_results[lanes]["map"]
+        vd = vd_for_target_density(calib_map, rho_target)
+        print(f"lanes_count={lanes}: vehicles_density ≈ {vd:.3f}")
